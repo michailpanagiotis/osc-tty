@@ -2,15 +2,11 @@ use std::process::{Command, Stdio, Child, ChildStdin};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::io::{self, Write, Read};
-use log::debug;
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
-use signal_hook::consts::signal::*;
-use signal_hook::iterator::Signals;
 
 pub struct Subcommand {
     child: Arc<Mutex<Child>>,
     child_stdin: Arc<Mutex<ChildStdin>>,
+    child_pid: u32,
 }
 
 impl Subcommand {
@@ -28,31 +24,6 @@ impl Subcommand {
         let mut child_stdout = child.stdout.take().ok_or("Failed to open stdout")?;
 
         let child_shared = Arc::new(Mutex::new(child));
-        let child_for_signal = Arc::clone(&child_shared);
-
-        // Set up signal handling
-        thread::spawn(move || {
-            let mut signals = Signals::new([SIGINT, SIGTERM]).expect("Failed to register signals");
-            #[allow(clippy::never_loop)]
-            for sig in signals.forever() {
-                debug!("Received signal {:?}, terminating child process (PID: {})...", sig, child_pid);
-
-                // Try to kill the child process using its PID
-                let pid = Pid::from_raw(child_pid as i32);
-                let _ = kill(pid, Signal::SIGTERM);
-
-                // Give it a moment to terminate gracefully
-                thread::sleep(std::time::Duration::from_millis(100));
-
-                // Force kill if still running
-                if let Ok(mut child) = child_for_signal.try_lock() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-
-                std::process::exit(0);
-            }
-        });
 
         let prompt = Arc::new(Mutex::new(String::new()));
         let prompt_clone = Arc::clone(&prompt);
@@ -91,6 +62,7 @@ impl Subcommand {
         Ok(Subcommand {
             child: child_shared,
             child_stdin,
+            child_pid,
         })
     }
 
@@ -98,7 +70,7 @@ impl Subcommand {
         Arc::clone(&self.child_stdin)
     }
 
-    pub fn wait_for_exit(self) -> i32 {
+    pub fn wait_for_exit(&self) -> i32 {
         let mut child = self.child.lock().unwrap();
         let status = child.wait().expect("Failed to wait on child");
         status.code().unwrap_or(1)
@@ -128,5 +100,23 @@ impl Subcommand {
                 }
             }
         });
+    }
+
+    pub fn terminate_gracefully(&self) {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+
+        // Use the stored PID directly - no need to acquire the lock
+        let pid_for_kill = self.child_pid as i32;
+
+        let pid = Pid::from_raw(pid_for_kill);
+        let _ = kill(pid, Signal::SIGTERM);
+
+        // Give it a moment to terminate gracefully
+        thread::sleep(std::time::Duration::from_millis(500));
+
+        // Try to force kill if still running
+        let pid = Pid::from_raw(pid_for_kill);
+        let _ = kill(pid, Signal::SIGKILL);
     }
 }
